@@ -1,16 +1,16 @@
 <# 
-This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (storage account keys) stored in Azure Key Vault by responding to Event Grid events. 
-It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs..
+This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (storage account connection strings) stored in Azure Key Vault by responding to Event Grid events. 
+It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs.
 #>
 
-# Parameters for the Azure Function triggered by an Event Grid Event
+# Parameters for the Azure Function triggered by an Event Grid Event.
 param([object]$EventGridEvent, [object]$TriggerMetadata)
 
 # Constants
-$MAX_RETRY_ATTEMPTS = 30  # Maximum number of retry attempts to poll for a secret update
-$MAX_JSON_DEPTH = 10      # Maximum JSON depth allowed when serializing objects
-$DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for Key Vault data plane operations
-$AZURE_FUNCTION_NAME = "AkvStorageAccountConnectionStringConnector" # Name of the Azure Function
+$MAX_RETRY_ATTEMPTS = 30  # Maximum number of retry attempts to poll for a secret update.
+$MAX_JSON_DEPTH = 10      # Maximum JSON depth allowed when serializing objects.
+$DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for Key Vault data plane operations.
+$AZURE_FUNCTION_NAME = "AkvStorageAccountConnectionStringConnector" # Name of the Azure Function.
 
 # Extract subscription ID, resource group name, and app name from environment variables to construct the expected function resource ID.
 # These environment variables are set by the Azure Function App runtime.
@@ -18,11 +18,11 @@ $EXPECTED_FUNCTION_APP_SUBSCRIPTION_ID = $env:WEBSITE_OWNER_NAME.Substring(0, 36
 $EXPECTED_FUNCTION_APP_RG_NAME = $env:WEBSITE_RESOURCE_GROUP
 $EXPECTED_FUNCTION_APP_NAME = $env:WEBSITE_SITE_NAME
 
-# Construct the expected Azure Function resource ID
+# Construct the expected Azure Function resource ID.
 $EXPECTED_FUNCTION_RESOURCE_ID = "/subscriptions/$EXPECTED_FUNCTION_APP_SUBSCRIPTION_ID/resourceGroups/$EXPECTED_FUNCTION_APP_RG_NAME/providers/Microsoft.Web/sites/$EXPECTED_FUNCTION_APP_NAME/functions/$AZURE_FUNCTION_NAME"
 
 # Function to get the inactive credential ID based on the currently active credential (either 'key1' or 'key2').
-# Azure Storage Accounts typically have two access keys, and this function switches between them.
+# Azure Storage Accounts typically have two access connection strings, and this function switches between them.
 function Get-InactiveCredentialId([string]$ActiveCredentialId) {
     $inactiveCredentialId = switch ($ActiveCredentialId) {
         "key1" { "key2" }
@@ -35,24 +35,24 @@ function Get-InactiveCredentialId([string]$ActiveCredentialId) {
 # Function to retrieve the value of the active credential (storage account key) from Azure.
 # It checks for valid inputs and retrieves the specified key from the storage account.
 function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddress) {
-    # Validate if the active credential ID is provided
+    # Validate if the active credential ID is provided.
     if (-not ($ActiveCredentialId)) {
         return @($null, "The active credential ID is missing.")
     }
-    # Ensure the credential ID matches the expected pattern ('key1' or 'key2')
+    # Ensure the credential ID matches the expected pattern ('key1' or 'key2').
     if ($ActiveCredentialId -notin @("key1", "key2")) {
         return @($null, "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'key1' or 'key2'.")
     }
-    # Validate if the provider address (resource ID of the storage account) is provided
+    # Validate if the provider address (resource ID of the storage account) is provided.
     if (-not ($ProviderAddress)) {
         return @($null, "The provider address is missing.")
     }
-    # Ensure the provider address matches the expected Azure Storage Account resource format
+    # Ensure the provider address matches the expected Azure Storage Account resource format.
     if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Storage/storageAccounts/([^/]+)")) {
         return @($null, "The provider address '$ProviderAddress' didn't match the expected pattern.")
     }
 
-    # Extract details from the provider address (subscription ID, resource group, storage account name)
+    # Extract details from the provider address (subscription ID, resource group, storage account name).
     $subscriptionId = $Matches[1]
     $resourceGroupName = $Matches[2]
     $storageAccountName = $Matches[3]
@@ -60,13 +60,13 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
     # Select the subscription to operate on
     $null = Select-AzSubscription -SubscriptionId $subscriptionId
 
-    # Retrieve the specified storage account key (credential) from the storage account
+    # Retrieve the specified storage account key (credential) from the storage account.
     try {
         $accountKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $ActiveCredentialId).value
         $credentialValue = "DefaultEndpointsProtocol=https;AccountName=$storageAccountName;AccountKey=$accountKey"
         return @($credentialValue, $null)
     } catch [Microsoft.Rest.Azure.CloudException] {
-        # Handle any exceptions by logging detailed information and re-throwing the exception
+        # Handle any exceptions by logging detailed information and re-throwing the exception.
         $httpStatusCode = $_.Exception.Response.StatusCode
         $httpStatusCodeDescription = "$([int]$httpStatusCode) ($httpStatusCode)"
         $requestUri = $_.Exception.Request.RequestUri
@@ -97,10 +97,10 @@ function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$P
 
     $null = Select-AzSubscription -SubscriptionId $subscriptionId
 
-    # Attempt to regenerate the inactive credential (storage account key) and return it
+    # Attempt to regenerate the inactive credential (storage account key) and return it.
     try {
         $null = New-AzStorageAccountKey -ResourceGroupName $resourceGroupName -Name $storageAccountName -KeyName $InactiveCredentialId
-        $accountKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $InactiveCredentialId).value
+        $accountKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $ActiveCredentialId).value
         $credentialValue = "DefaultEndpointsProtocol=https;AccountName=$storageAccountName;AccountKey=$accountKey"
         return @($credentialValue, $null)
     } catch [Microsoft.Rest.Azure.CloudException] {
@@ -131,7 +131,7 @@ function Get-CurrentSecret(
     $actualLifecycleState = $null
     $actualFunctionResourceId = $null
 
-    # Get the auth token for authenticating requests to Key Vault
+    # Get the auth token for authenticating requests to Key Vault.
     $token = (Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString).Token
 
     # In rare cases, this handler might receive the published event before AKV has finished committing to storage.
@@ -140,13 +140,13 @@ function Get-CurrentSecret(
         $clientRequestId = [Guid]::NewGuid().ToString()
         Write-Host "  Attempt #$i with x-ms-client-request-id: '$clientRequestId'"
 
-         # Define HTTP headers for the request
+         # Define HTTP headers for the request.
         $headers = @{
             "User-Agent"             = "$AZURE_FUNCTION_NAME/1.0 ($CallerName; Step 1; Attempt $i)"
             "x-ms-client-request-id" = $clientRequestId
         }
 
-        # Perform a GET request to fetch the current secret from Key Vault
+        # Perform a GET request to fetch the current secret from Key Vault.
         $response = Invoke-WebRequest -Uri "${UnversionedSecretId}?api-version=$DATA_PLANE_API_VERSION" `
             -Method "GET" `
             -Authentication OAuth `
@@ -209,7 +209,7 @@ function Update-PendingSecret(
         "x-ms-client-request-id" = $clientRequestId
     }
 
-    # Perform an HTTP PUT request to update the secret's state to 'Pending'.
+    # Perform an HTTP PUT request to update the secret's state via UpdatePendingSecret API.
     try {
         $response = Invoke-WebRequest -Uri "${UnversionedSecretId}/pending?api-version=$DATA_PLANE_API_VERSION" `
             -Method "PUT" `
@@ -339,7 +339,7 @@ function Invoke-PendingSecretRotation([string]$VersionedSecretId, [string]$Unver
 # Set the error action preference to "Stop" to halt script execution on errors.
 $ErrorActionPreference = "Stop"
 
-# Extract the event type and versioned secret ID for further operations
+# Extract the event type and versioned secret ID for further operations.
 $EventGridEvent | ConvertTo-Json -Depth $MAX_JSON_DEPTH -Compress | Write-Host
 $eventType = $EventGridEvent.eventType
 $versionedSecretId = $EventGridEvent.data.Id
