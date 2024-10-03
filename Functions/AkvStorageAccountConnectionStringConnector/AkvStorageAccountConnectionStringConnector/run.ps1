@@ -22,7 +22,7 @@ $EXPECTED_FUNCTION_APP_NAME = $env:WEBSITE_SITE_NAME
 $EXPECTED_FUNCTION_RESOURCE_ID = "/subscriptions/$EXPECTED_FUNCTION_APP_SUBSCRIPTION_ID/resourceGroups/$EXPECTED_FUNCTION_APP_RG_NAME/providers/Microsoft.Web/sites/$EXPECTED_FUNCTION_APP_NAME/functions/$AZURE_FUNCTION_NAME"
 
 # Function to get the inactive credential ID based on the currently active credential (either 'key1' or 'key2').
-# Azure Storage Accounts typically have two access connection strings, and this function switches between them.
+# Azure Storage Accounts typically have two connection strings, and this function switches between them.
 function Get-InactiveCredentialId([string]$ActiveCredentialId) {
     $inactiveCredentialId = switch ($ActiveCredentialId) {
         "key1" { "key2" }
@@ -100,7 +100,7 @@ function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$P
     # Attempt to regenerate the inactive credential (storage account key) and return it.
     try {
         $null = New-AzStorageAccountKey -ResourceGroupName $resourceGroupName -Name $storageAccountName -KeyName $InactiveCredentialId
-        $accountKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $ActiveCredentialId).value
+        $accountKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $InactiveCredentialId).value
         $credentialValue = "DefaultEndpointsProtocol=https;AccountName=$storageAccountName;AccountKey=$accountKey"
         return @($credentialValue, $null)
     } catch [Microsoft.Rest.Azure.CloudException] {
