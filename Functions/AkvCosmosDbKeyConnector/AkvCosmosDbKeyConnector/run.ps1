@@ -1,16 +1,16 @@
 <# 
-This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (storage account keys) stored in Azure Key Vault by responding to Event Grid events. 
-It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs..
+This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (CosmosDb account keys) stored in Azure Key Vault by responding to Event Grid events. 
+It ensures that secrets are updated and synchronized with their associated CosmosDb accounts, helping automate secret management using Key Vault data plane APIs.
 #>
 
-# Parameters for the Azure Function triggered by an Event Grid Event
+# Parameters for the Azure Function triggered by an Event Grid Event.
 param([object]$EventGridEvent, [object]$TriggerMetadata)
 
 # Constants
-$MAX_RETRY_ATTEMPTS = 30  # Maximum number of retry attempts to poll for a secret update
-$MAX_JSON_DEPTH = 10      # Maximum JSON depth allowed when serializing objects
-$DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for Key Vault data plane operations
-$AZURE_FUNCTION_NAME = "AkvCosmosDbKeyConnector" # Name of the Azure Function
+$MAX_RETRY_ATTEMPTS = 30  # Maximum number of retry attempts to poll for a secret update.
+$MAX_JSON_DEPTH = 10      # Maximum JSON depth allowed when serializing objects.
+$DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for Key Vault data plane operations.
+$AZURE_FUNCTION_NAME = "AkvCosmosDbKeyConnector" # Name of the Azure Function.
 
 # Extract subscription ID, resource group name, and app name from environment variables to construct the expected function resource ID.
 # These environment variables are set by the Azure Function App runtime.
@@ -18,55 +18,66 @@ $EXPECTED_FUNCTION_APP_SUBSCRIPTION_ID = $env:WEBSITE_OWNER_NAME.Substring(0, 36
 $EXPECTED_FUNCTION_APP_RG_NAME = $env:WEBSITE_RESOURCE_GROUP
 $EXPECTED_FUNCTION_APP_NAME = $env:WEBSITE_SITE_NAME
 
-# Construct the expected Azure Function resource ID
+# Construct the expected Azure Function resource ID.
 $EXPECTED_FUNCTION_RESOURCE_ID = "/subscriptions/$EXPECTED_FUNCTION_APP_SUBSCRIPTION_ID/resourceGroups/$EXPECTED_FUNCTION_APP_RG_NAME/providers/Microsoft.Web/sites/$EXPECTED_FUNCTION_APP_NAME/functions/$AZURE_FUNCTION_NAME"
 
-# Function to get the inactive credential ID based on the currently active credential (either 'key1' or 'key2').
-# Azure Storage Accounts typically have two access keys, and this function switches between them.
+# Function to get the inactive credential ID based on the currently active credential (either 'PrimaryMasterKey' or 'SecondaryMasterKey').
+# Azure CosmosDb Account has two read-write access keys - PrimaryMasterKey and SecondaryMasterKey, and this function switches between them.
 function Get-InactiveCredentialId([string]$ActiveCredentialId) {
     $inactiveCredentialId = switch ($ActiveCredentialId) {
-        "primary" { "secondary" }
-        "secondary" { "primary" }
-        default { throw "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'key1' or 'key2'." }
+        "PrimaryMasterKey" { "SecondaryMasterKey" }
+        "SecondaryMasterKey" { "PrimaryMasterKey" }
+        default { throw "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'PrimaryMasterKey' or 'SecondaryMasterKey'." }
     }
     return $inactiveCredentialId
 }
 
-# Function to retrieve the value of the active credential (storage account key) from Azure.
-# It checks for valid inputs and retrieves the specified key from the storage account.
+# Function to get the key kind(primary or secondary) based on the passed credential (either 'PrimaryMasterKey' or 'SecondaryMasterKey').
+# Azure CosmosDb Account has two kinds of read-write access secondary, and this function maps access keys to the key kind required for key re-generation.
+function Get-KeyKindForRegeneration([string]$CredentialId) {
+    $keyKind = switch ($CredentialId) {
+        "PrimaryMasterKey" { "primary" }
+        "SecondaryMasterKey" { "secondary" }
+        default { throw "The credential ID '$CredentialId' didn't match the expected pattern. Expected 'PrimaryMasterKey' or 'SecondaryMasterKey'." }
+    }
+    return $keyKind
+}
+
+# Function to retrieve the value of the active credential (CosmosDb account key) from Azure.
+# It checks for valid inputs and retrieves the specified key from the CosmosDb account.
 function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddress) {
-    # Validate if the active credential ID is provided
+    # Validate if the active credential ID is provided.
     if (-not ($ActiveCredentialId)) {
         return @($null, "The active credential ID is missing.")
     }
-    # Ensure the credential ID matches the expected pattern ('key1' or 'key2')
-    if ($ActiveCredentialId -notin @("primary", "secondary")) {
-        return @($null, "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'key1' or 'key2'.")
+    # Ensure the credential ID matches the expected pattern ('PrimaryMasterKey' or 'SecondaryMasterKey').
+    if ($ActiveCredentialId -notin @("PrimaryMasterKey", "SecondaryMasterKey")) {
+        return @($null, "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'PrimaryMasterKey' or 'SecondaryMasterKey'.")
     }
-    # Validate if the provider address (resource ID of the storage account) is provided
+    # Validate if the provider address (resource ID of the CosmosDb account) is provided.
     if (-not ($ProviderAddress)) {
         return @($null, "The provider address is missing.")
     }
-    # Ensure the provider address matches the expected Azure Storage Account resource format
+    # Ensure the provider address matches the expected Azure CosmosDb Account resource format.
     if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.DocumentDB/databaseAccounts/([^/]+)")) {
         return @($null, "The provider address '$ProviderAddress' didn't match the expected pattern.")
     }
 
-    # Extract details from the provider address (subscription ID, resource group, storage account name)
+    # Extract details from the provider address (subscription ID, resource group, CosmosDb account name).
     $subscriptionId = $Matches[1]
     $resourceGroupName = $Matches[2]
-    $storageAccountName = $Matches[3]
+    $CosmosDbAccountName = $Matches[3]
 
     # Select the subscription to operate on
     $null = Select-AzSubscription -SubscriptionId $subscriptionId
 
-    # Retrieve the specified storage account key (credential) from the storage account
+    # Retrieve the specified CosmosDb account key (credential) from the CosmosDb account.
     try {
-        # Retrieve the specified Cosmos DB account key
-        $cosmosDbKey = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName | Where-Object KeyName -eq $ActiveCredentialId).PrimaryMasterKey
-        return @($cosmosDbKey, $null)
+         # Retrieve the specified Cosmos DB account key
+         $cosmosDbKey = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -Type "Keys").$ActiveCredentialId
+         return @($cosmosDbKey, $null)
     } catch [Microsoft.Rest.Azure.CloudException] {
-        # Handle any exceptions by logging detailed information and re-throwing the exception
+        # Handle any exceptions by logging detailed information and re-throwing the exception.
         $httpStatusCode = $_.Exception.Response.StatusCode
         $httpStatusCodeDescription = "$([int]$httpStatusCode) ($httpStatusCode)"
         $requestUri = $_.Exception.Request.RequestUri
@@ -82,7 +93,7 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
     }
 }
 
-# Function to regenerate a storage account key (credential).
+# Function to regenerate a CosmosDb account key (credential).
 # This function generates a new inactive credential, which can later be made active.
 function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$ProviderAddress) {
     if (-not ($ProviderAddress)) {
@@ -93,15 +104,16 @@ function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$P
     }
     $subscriptionId = $Matches[1]
     $resourceGroupName = $Matches[2]
-    $storageAccountName = $Matches[3]
+    $CosmosDbAccountName = $Matches[3]
 
     $null = Select-AzSubscription -SubscriptionId $subscriptionId
 
-    # Attempt to regenerate the inactive credential (storage account key) and return it
+    # Attempt to regenerate the inactive credential (CosmosDb account key) and return it.
     try {
         # Regenerate the inactive key
-        $null = New-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -KeyName $InactiveCredentialId
-        $credentialValue = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName | Where-Object KeyName -eq $InactiveCredentialId).PrimaryMasterKey
+        $keyKindToRegerenerate = Get-KeyKindForRegeneration -CredentialId $InactiveCredentialId
+        $null = New-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -KeyKind $keyKindToRegerenerate
+        $credentialValue = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -Type "Keys").$InactiveCredentialId
         return @($credentialValue, $null)        
     } catch [Microsoft.Rest.Azure.CloudException] {
         $httpStatusCode = $_.Exception.Response.StatusCode
@@ -131,22 +143,22 @@ function Get-CurrentSecret(
     $actualLifecycleState = $null
     $actualFunctionResourceId = $null
 
-    # Get the auth token for authenticating requests to Key Vault
+    # Get the auth token for authenticating requests to Key Vault.
     $token = (Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString).Token
 
-    # In rare cases, this handler might receive the published event before AKV has finished committing to storage.
+    # In rare cases, this handler might receive the published event before AKV has finished committing to CosmosDb.
     # To mitigate this, poll the current secret for up to 30s until its current lifecycle state matches that of the published event.
     foreach ($i in 1..$MAX_RETRY_ATTEMPTS) {
         $clientRequestId = [Guid]::NewGuid().ToString()
         Write-Host "  Attempt #$i with x-ms-client-request-id: '$clientRequestId'"
 
-         # Define HTTP headers for the request
+         # Define HTTP headers for the request.
         $headers = @{
             "User-Agent"             = "$AZURE_FUNCTION_NAME/1.0 ($CallerName; Step 1; Attempt $i)"
             "x-ms-client-request-id" = $clientRequestId
         }
 
-        # Perform a GET request to fetch the current secret from Key Vault
+        # Perform a GET request to fetch the current secret from Key Vault.
         $response = Invoke-WebRequest -Uri "${UnversionedSecretId}?api-version=$DATA_PLANE_API_VERSION" `
             -Method "GET" `
             -Authentication OAuth `
@@ -209,7 +221,7 @@ function Update-PendingSecret(
         "x-ms-client-request-id" = $clientRequestId
     }
 
-    # Perform an HTTP PUT request to update the secret's state to 'Pending'.
+    # Perform an HTTP PUT request to update the secret's state via UpdatePendingSecret API.
     try {
         $response = Invoke-WebRequest -Uri "${UnversionedSecretId}/pending?api-version=$DATA_PLANE_API_VERSION" `
             -Method "PUT" `
@@ -339,7 +351,7 @@ function Invoke-PendingSecretRotation([string]$VersionedSecretId, [string]$Unver
 # Set the error action preference to "Stop" to halt script execution on errors.
 $ErrorActionPreference = "Stop"
 
-# Extract the event type and versioned secret ID for further operations
+# Extract the event type and versioned secret ID for further operations.
 $EventGridEvent | ConvertTo-Json -Depth $MAX_JSON_DEPTH -Compress | Write-Host
 $eventType = $EventGridEvent.eventType
 $versionedSecretId = $EventGridEvent.data.Id
