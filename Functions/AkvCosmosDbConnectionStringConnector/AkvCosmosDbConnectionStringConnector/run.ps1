@@ -1,6 +1,6 @@
 <# 
 This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (storage account keys) stored in Azure Key Vault by responding to Event Grid events. 
-It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs.
+It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs..
 #>
 
 # Parameters for the Azure Function triggered by an Event Grid Event
@@ -48,7 +48,7 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
         return @($null, "The provider address is missing.")
     }
     # Ensure the provider address matches the expected Azure Storage Account resource format
-    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Storage/storageAccounts/([^/]+)")) {
+    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.DocumentDB/databaseAccounts/([^/]+)")) {
         return @($null, "The provider address '$ProviderAddress' didn't match the expected pattern.")
     }
 
@@ -62,8 +62,8 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
 
     # Retrieve the specified storage account key (credential) from the storage account
     try {
-        $accountKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $ActiveCredentialId).value
-        $credentialValue = "DefaultEndpointsProtocol=https;AccountName=$storageAccountName;AccountKey=$accountKey"
+        $accountKey = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName | Where-Object KeyName -eq $ActiveCredentialId).PrimaryMasterKey
+        $credentialValue = "AccountEndpoint=https://$cosmosDbAccountName.documents.azure.com:443/;AccountKey=$accountKey;"
         return @($credentialValue, $null)
     } catch [Microsoft.Rest.Azure.CloudException] {
         # Handle any exceptions by logging detailed information and re-throwing the exception
@@ -88,7 +88,7 @@ function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$P
     if (-not ($ProviderAddress)) {
         return @($null, "The provider address is missing.")
     }
-    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Storage/storageAccounts/([^/]+)")) {
+    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.DocumentDB/databaseAccounts/([^/]+)")) {
         return @($null, "The provider address '$ProviderAddress' didn't match the expected pattern.")
     }
     $subscriptionId = $Matches[1]
@@ -99,9 +99,9 @@ function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$P
 
     # Attempt to regenerate the inactive credential (storage account key) and return it
     try {
-        $null = New-AzStorageAccountKey -ResourceGroupName $resourceGroupName -Name $storageAccountName -KeyName $InactiveCredentialId
-        $accountKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $InactiveCredentialId).value
-        $credentialValue = "DefaultEndpointsProtocol=https;AccountName=$storageAccountName;AccountKey=$accountKey"
+        $null = New-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -KeyName $InactiveCredentialId
+        $accountKey = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName | Where-Object KeyName -eq $InactiveCredentialId).PrimaryMasterKey
+        $credentialValue = "AccountEndpoint=https://$cosmosDbAccountName.documents.azure.com:443/;AccountKey=$accountKey;"
         return @($credentialValue, $null)
     } catch [Microsoft.Rest.Azure.CloudException] {
         $httpStatusCode = $_.Exception.Response.StatusCode

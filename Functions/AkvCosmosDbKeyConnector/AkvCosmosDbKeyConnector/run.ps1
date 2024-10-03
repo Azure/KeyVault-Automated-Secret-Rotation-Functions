@@ -1,6 +1,6 @@
 <# 
 This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (storage account keys) stored in Azure Key Vault by responding to Event Grid events. 
-It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs.
+It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs..
 #>
 
 # Parameters for the Azure Function triggered by an Event Grid Event
@@ -10,7 +10,7 @@ param([object]$EventGridEvent, [object]$TriggerMetadata)
 $MAX_RETRY_ATTEMPTS = 30  # Maximum number of retry attempts to poll for a secret update
 $MAX_JSON_DEPTH = 10      # Maximum JSON depth allowed when serializing objects
 $DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for Key Vault data plane operations
-$AZURE_FUNCTION_NAME = "AkvStorageAccountConnectionStringConnector" # Name of the Azure Function
+$AZURE_FUNCTION_NAME = "AkvCosmosDbKeyConnector" # Name of the Azure Function
 
 # Extract subscription ID, resource group name, and app name from environment variables to construct the expected function resource ID.
 # These environment variables are set by the Azure Function App runtime.
@@ -25,8 +25,8 @@ $EXPECTED_FUNCTION_RESOURCE_ID = "/subscriptions/$EXPECTED_FUNCTION_APP_SUBSCRIP
 # Azure Storage Accounts typically have two access keys, and this function switches between them.
 function Get-InactiveCredentialId([string]$ActiveCredentialId) {
     $inactiveCredentialId = switch ($ActiveCredentialId) {
-        "key1" { "key2" }
-        "key2" { "key1" }
+        "primary" { "secondary" }
+        "secondary" { "primary" }
         default { throw "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'key1' or 'key2'." }
     }
     return $inactiveCredentialId
@@ -40,7 +40,7 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
         return @($null, "The active credential ID is missing.")
     }
     # Ensure the credential ID matches the expected pattern ('key1' or 'key2')
-    if ($ActiveCredentialId -notin @("key1", "key2")) {
+    if ($ActiveCredentialId -notin @("primary", "secondary")) {
         return @($null, "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'key1' or 'key2'.")
     }
     # Validate if the provider address (resource ID of the storage account) is provided
@@ -48,7 +48,7 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
         return @($null, "The provider address is missing.")
     }
     # Ensure the provider address matches the expected Azure Storage Account resource format
-    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Storage/storageAccounts/([^/]+)")) {
+    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.DocumentDB/databaseAccounts/([^/]+)")) {
         return @($null, "The provider address '$ProviderAddress' didn't match the expected pattern.")
     }
 
@@ -62,9 +62,9 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
 
     # Retrieve the specified storage account key (credential) from the storage account
     try {
-        $accountKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $ActiveCredentialId).value
-        $credentialValue = "DefaultEndpointsProtocol=https;AccountName=$storageAccountName;AccountKey=$accountKey"
-        return @($credentialValue, $null)
+        # Retrieve the specified Cosmos DB account key
+        $cosmosDbKey = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName | Where-Object KeyName -eq $ActiveCredentialId).PrimaryMasterKey
+        return @($cosmosDbKey, $null)
     } catch [Microsoft.Rest.Azure.CloudException] {
         # Handle any exceptions by logging detailed information and re-throwing the exception
         $httpStatusCode = $_.Exception.Response.StatusCode
@@ -88,7 +88,7 @@ function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$P
     if (-not ($ProviderAddress)) {
         return @($null, "The provider address is missing.")
     }
-    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Storage/storageAccounts/([^/]+)")) {
+    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.DocumentDB/databaseAccounts/([^/]+)")) {
         return @($null, "The provider address '$ProviderAddress' didn't match the expected pattern.")
     }
     $subscriptionId = $Matches[1]
@@ -99,10 +99,10 @@ function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$P
 
     # Attempt to regenerate the inactive credential (storage account key) and return it
     try {
-        $null = New-AzStorageAccountKey -ResourceGroupName $resourceGroupName -Name $storageAccountName -KeyName $InactiveCredentialId
-        $accountKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $InactiveCredentialId).value
-        $credentialValue = "DefaultEndpointsProtocol=https;AccountName=$storageAccountName;AccountKey=$accountKey"
-        return @($credentialValue, $null)
+        # Regenerate the inactive key
+        $null = New-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -KeyName $InactiveCredentialId
+        $credentialValue = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName | Where-Object KeyName -eq $InactiveCredentialId).PrimaryMasterKey
+        return @($credentialValue, $null)        
     } catch [Microsoft.Rest.Azure.CloudException] {
         $httpStatusCode = $_.Exception.Response.StatusCode
         $httpStatusCodeDescription = "$([int]$httpStatusCode) ($httpStatusCode)"

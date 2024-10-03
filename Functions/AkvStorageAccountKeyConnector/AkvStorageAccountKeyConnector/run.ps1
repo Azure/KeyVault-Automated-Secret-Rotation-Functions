@@ -1,6 +1,6 @@
 <# 
 This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (storage account keys) stored in Azure Key Vault by responding to Event Grid events. 
-It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs..
+It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs.
 #>
 
 # Parameters for the Azure Function triggered by an Event Grid Event
