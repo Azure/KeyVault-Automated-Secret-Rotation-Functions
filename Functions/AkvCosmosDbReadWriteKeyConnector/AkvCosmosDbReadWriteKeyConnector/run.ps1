@@ -10,7 +10,7 @@ param([object]$EventGridEvent, [object]$TriggerMetadata)
 $MAX_RETRY_ATTEMPTS = 30  # Maximum number of retry attempts to poll for a secret update.
 $MAX_JSON_DEPTH = 10      # Maximum JSON depth allowed when serializing objects.
 $DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for Key Vault data plane operations.
-$AZURE_FUNCTION_NAME = "AkvCosmosDbKeyConnector" # Name of the Azure Function.
+$AZURE_FUNCTION_NAME = "AkvCosmosDbReadWriteKeyConnector" # Name of the Azure Function.
 
 # Extract subscription ID, resource group name, and app name from environment variables to construct the expected function resource ID.
 # These environment variables are set by the Azure Function App runtime.
@@ -33,7 +33,7 @@ function Get-InactiveCredentialId([string]$ActiveCredentialId) {
 }
 
 # Function to get the key kind(primary or secondary) based on the passed credential (either 'PrimaryMasterKey' or 'SecondaryMasterKey').
-# Azure CosmosDb Account has two kinds of read-write access secondary, and this function maps access keys to the key kind required for key re-generation.
+# Azure CosmosDb Account has two kinds of read-write access keys - primary and secondary, and this function maps access keys to the key kind required for key re-generation.
 function Get-KeyKindForRegeneration([string]$CredentialId) {
     $keyKind = switch ($CredentialId) {
         "PrimaryMasterKey" { "primary" }
@@ -74,8 +74,8 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
     # Retrieve the specified CosmosDb account key (credential) from the CosmosDb account.
     try {
          # Retrieve the specified Cosmos DB account key
-         $cosmosDbKey = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -Type "Keys").$ActiveCredentialId
-         return @($cosmosDbKey, $null)
+         $credentialValue = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -Type "Keys").$ActiveCredentialId
+         return @($credentialValue, $null)
     } catch [Microsoft.Rest.Azure.CloudException] {
         # Handle any exceptions by logging detailed information and re-throwing the exception.
         $httpStatusCode = $_.Exception.Response.StatusCode
@@ -112,8 +112,7 @@ function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$P
     try {
         # Regenerate the inactive key
         $keyKindToRegerenerate = Get-KeyKindForRegeneration -CredentialId $InactiveCredentialId
-        $null = New-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -KeyKind $keyKindToRegerenerate
-        $credentialValue = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -Type "Keys").$InactiveCredentialId
+        $credentialValue = New-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -KeyKind $keyKindToRegerenerate
         return @($credentialValue, $null)        
     } catch [Microsoft.Rest.Azure.CloudException] {
         $httpStatusCode = $_.Exception.Response.StatusCode
