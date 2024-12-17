@@ -1,6 +1,6 @@
 <# 
-This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (storage account keys) stored in Azure Key Vault by responding to Event Grid events. 
-It ensures that secrets are updated and synchronized with their associated storage accounts, helping automate secret management using Key Vault data plane APIs.
+This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (CosmosDb account keys) stored in Azure Key Vault by responding to Event Grid events. 
+It ensures that secrets are updated and synchronized with their associated CosmosDb accounts, helping automate secret management using Key Vault data plane APIs.
 #>
 
 # Parameters for the Azure Function triggered by an Event Grid Event.
@@ -10,7 +10,7 @@ param([object]$EventGridEvent, [object]$TriggerMetadata)
 $MAX_RETRY_ATTEMPTS = 30  # Maximum number of retry attempts to poll for a secret update.
 $MAX_JSON_DEPTH = 10      # Maximum JSON depth allowed when serializing objects.
 $DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for Key Vault data plane operations.
-$AZURE_FUNCTION_NAME = "AkvStorageAccountKeyConnector" # Name of the Azure Function.
+$AZURE_FUNCTION_NAME = "AkvCosmosDbReadWriteKeyConnector" # Name of the Azure Function.
 
 # Extract subscription ID, resource group name, and app name from environment variables to construct the expected function resource ID.
 # These environment variables are set by the Azure Function App runtime.
@@ -48,49 +48,61 @@ function Main {
     }
 }
 
-# Function to get the inactive credential ID based on the currently active credential (either 'key1' or 'key2').
-# Azure Storage Accounts have two access keys, and this function switches between them.
+# Function to get the inactive credential ID based on the currently active credential (either 'PrimaryMasterKey' or 'SecondaryMasterKey').
+# Azure CosmosDb Account has two read-write access keys - PrimaryMasterKey and SecondaryMasterKey, and this function switches between them.
 function Get-InactiveCredentialId([string]$ActiveCredentialId) {
     $inactiveCredentialId = switch ($ActiveCredentialId) {
-        "key1" { "key2" }
-        "key2" { "key1" }
-        default { throw "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'key1' or 'key2'." }
+        "PrimaryMasterKey" { "SecondaryMasterKey" }
+        "SecondaryMasterKey" { "PrimaryMasterKey" }
+        default { throw "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'PrimaryMasterKey' or 'SecondaryMasterKey'." }
     }
     return $inactiveCredentialId
 }
 
-# Function to retrieve the value of the active credential (storage account key) from Azure.
-# It checks for valid inputs and retrieves the specified key from the storage account.
+# Function to get the key kind(primary or secondary) based on the passed credential (either 'PrimaryMasterKey' or 'SecondaryMasterKey').
+# Azure CosmosDb Account has two kinds of read-write access keys - primary and secondary, and this function maps access keys to the key kind required for key re-generation.
+function Get-KeyKindForRegeneration([string]$CredentialId) {
+    $keyKind = switch ($CredentialId) {
+        "PrimaryMasterKey" { "primary" }
+        "SecondaryMasterKey" { "secondary" }
+        default { throw "The credential ID '$CredentialId' didn't match the expected pattern. Expected 'PrimaryMasterKey' or 'SecondaryMasterKey'." }
+    }
+    return $keyKind
+}
+
+# Function to retrieve the value of the active credential (CosmosDb account key) from Azure.
+# It checks for valid inputs and retrieves the specified key from the CosmosDb account.
 function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddress) {
     # Validate if the active credential ID is provided.
     if (-not ($ActiveCredentialId)) {
         return @($null, "The active credential ID is missing.")
     }
-    # Ensure the credential ID matches the expected pattern ('key1' or 'key2').
-    if ($ActiveCredentialId -notin @("key1", "key2")) {
-        return @($null, "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'key1' or 'key2'.")
+    # Ensure the credential ID matches the expected pattern ('PrimaryMasterKey' or 'SecondaryMasterKey').
+    if ($ActiveCredentialId -notin @("PrimaryMasterKey", "SecondaryMasterKey")) {
+        return @($null, "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'PrimaryMasterKey' or 'SecondaryMasterKey'.")
     }
-    # Validate if the provider address (resource ID of the storage account) is provided.
+    # Validate if the provider address (resource ID of the CosmosDb account) is provided.
     if (-not ($ProviderAddress)) {
         return @($null, "The provider address is missing.")
     }
-    # Ensure the provider address matches the expected Azure Storage Account resource format.
-    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Storage/storageAccounts/([^/]+)")) {
+    # Ensure the provider address matches the expected Azure CosmosDb Account resource format.
+    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.DocumentDB/databaseAccounts/([^/]+)")) {
         return @($null, "The provider address '$ProviderAddress' didn't match the expected pattern.")
     }
 
-    # Extract details from the provider address (subscription ID, resource group, storage account name).
+    # Extract details from the provider address (subscription ID, resource group, CosmosDb account name).
     $subscriptionId = $Matches[1]
     $resourceGroupName = $Matches[2]
-    $storageAccountName = $Matches[3]
+    $CosmosDbAccountName = $Matches[3]
 
     # Select the subscription to operate on
     $null = Select-AzSubscription -SubscriptionId $subscriptionId
 
-    # Retrieve the specified storage account key (credential) from the storage account.
+    # Retrieve the specified CosmosDb account key (credential) from the CosmosDb account.
     try {
-        $credentialValue = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $ActiveCredentialId).value
-        return @($credentialValue, $null)
+         # Retrieve the specified Cosmos DB account key
+         $credentialValue = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -Type "Keys").$ActiveCredentialId
+         return @($credentialValue, $null)
     } catch [Microsoft.Rest.Azure.CloudException] {
         # Handle any exceptions by logging detailed information and re-throwing the exception.
         $httpStatusCode = $_.Exception.Response.StatusCode
@@ -108,26 +120,27 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
     }
 }
 
-# Function to regenerate a storage account key (credential).
+# Function to regenerate a CosmosDb account key (credential).
 # This function generates a new inactive credential, which can later be made active.
 function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$ProviderAddress) {
     if (-not ($ProviderAddress)) {
         return @($null, "The provider address is missing.")
     }
-    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.Storage/storageAccounts/([^/]+)")) {
+    if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.DocumentDB/databaseAccounts/([^/]+)")) {
         return @($null, "The provider address '$ProviderAddress' didn't match the expected pattern.")
     }
     $subscriptionId = $Matches[1]
     $resourceGroupName = $Matches[2]
-    $storageAccountName = $Matches[3]
+    $CosmosDbAccountName = $Matches[3]
 
     $null = Select-AzSubscription -SubscriptionId $subscriptionId
 
-    # Attempt to regenerate the inactive credential (storage account key) and return it.
+    # Attempt to regenerate the inactive credential (CosmosDb account key) and return it.
     try {
-        $null = New-AzStorageAccountKey -ResourceGroupName $resourceGroupName -Name $storageAccountName -KeyName $InactiveCredentialId
-        $credentialValue = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -AccountName $storageAccountName | Where-Object KeyName -eq $InactiveCredentialId).value
-        return @($credentialValue, $null)
+        # Regenerate the inactive key
+        $keyKindToRegerenerate = Get-KeyKindForRegeneration -CredentialId $InactiveCredentialId
+        $credentialValue = New-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -KeyKind $keyKindToRegerenerate
+        return @($credentialValue, $null)        
     } catch [Microsoft.Rest.Azure.CloudException] {
         $httpStatusCode = $_.Exception.Response.StatusCode
         $httpStatusCodeDescription = "$([int]$httpStatusCode) ($httpStatusCode)"
@@ -159,7 +172,7 @@ function Get-CurrentSecret(
     # Get the auth token for authenticating requests to Key Vault.
     $token = (Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString).Token
 
-    # In rare cases, this handler might receive the published event before AKV has finished committing to storage.
+    # In rare cases, this handler might receive the published event before AKV has finished committing to CosmosDb.
     # To mitigate this, poll the current secret for up to 30s until its current lifecycle state matches that of the published event.
     foreach ($i in 1..$MAX_RETRY_ATTEMPTS) {
         $clientRequestId = [Guid]::NewGuid().ToString()

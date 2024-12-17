@@ -245,7 +245,7 @@ function Update-PendingSecret(
             -Token $token `
             -ContentType "application/json" `
             -Headers $headers `
-            -Body $UpdatePendingSecretRequestBody
+            -Body $updatePendingSecretRequestBody
         $updatedSecret = $response.Content | ConvertFrom-Json
         $lifecycleState = $updatedSecret.attributes.lifecycleState
         $lifecycleDescription = $updatedSecret.attributes.lifecycleDescription
