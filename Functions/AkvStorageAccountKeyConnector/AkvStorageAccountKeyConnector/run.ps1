@@ -21,6 +21,33 @@ $EXPECTED_FUNCTION_APP_NAME = $env:WEBSITE_SITE_NAME
 # Construct the expected Azure Function resource ID.
 $EXPECTED_FUNCTION_RESOURCE_ID = "/subscriptions/$EXPECTED_FUNCTION_APP_SUBSCRIPTION_ID/resourceGroups/$EXPECTED_FUNCTION_APP_RG_NAME/providers/Microsoft.Web/sites/$EXPECTED_FUNCTION_APP_NAME/functions/$AZURE_FUNCTION_NAME"
 
+function Main {
+    # Set the error action preference to "Stop" to halt script execution on errors.
+    $ErrorActionPreference = "Stop"
+
+    # Extract the event type and versioned secret ID for further operations.
+    $EventGridEvent | ConvertTo-Json -Depth $MAX_JSON_DEPTH -Compress | Write-Host
+    $eventType = $EventGridEvent.eventType
+    $versionedSecretId = $EventGridEvent.data.Id
+    if (-not ($versionedSecretId -match "(https://[^/]+/[^/]+/[^/]+)/[0-9a-f]{32}")) {
+        throw "The versioned secret ID '$versionedSecretId' didn't match the expected pattern."
+    }
+    $unversionedSecretId = $Matches[1]
+
+    # Handle the EventGrid event based on its type.
+    switch ($eventType) {
+        "Microsoft.KeyVault.SecretImportPending" {
+            Invoke-PendingSecretImport -VersionedSecretId $versionedSecretId -UnversionedSecretId $unversionedSecretId
+        }
+        "Microsoft.KeyVault.SecretRotationPending" {
+            Invoke-PendingSecretRotation -VersionedSecretId $versionedSecretId -UnversionedSecretId $unversionedSecretId
+        }
+        default {
+            throw "The Event Grid event '$eventType' is unsupported. Expected 'Microsoft.KeyVault.SecretImportPending' or 'Microsoft.KeyVault.SecretRotationPending'."
+        }
+    }
+}
+
 # Function to get the inactive credential ID based on the currently active credential (either 'key1' or 'key2').
 # Azure Storage Accounts have two access keys, and this function switches between them.
 function Get-InactiveCredentialId([string]$ActiveCredentialId) {
@@ -197,7 +224,7 @@ function Get-CurrentSecret(
 # It updates the secret's attributes based on the provided request body.
 function Update-PendingSecret(
     [string]$UnversionedSecretId,
-    [string]$UpdatePendingSecretRequestBody,
+    [string]$PendingSecret,
     [string]$CallerName) {
     $clientRequestId = [Guid]::NewGuid().ToString()
     Write-Host "  x-ms-client-request-id: '$clientRequestId'"
@@ -206,6 +233,7 @@ function Update-PendingSecret(
         "User-Agent"             = "$AZURE_FUNCTION_NAME/1.0 ($CallerName; Step 3)"
         "x-ms-client-request-id" = $clientRequestId
     }
+    $updatePendingSecretRequestBody = ConvertTo-Json $PendingSecret -Depth $MAX_JSON_DEPTH -Compress
 
     # Perform an HTTP PUT request to update the secret's state via UpdatePendingSecret API.
     try {
@@ -254,7 +282,7 @@ function Invoke-PendingSecretImport([string]$VersionedSecretId, [string]$Unversi
     $expectedLifecycleState = "ImportPending"
     $callerName = "Invoke-PendingSecretImport"
 
-    Write-Host "Step 1: Get the current secret for validation and the ground truth."
+    Write-Host "Step 1: Get the current secret as the source of truth, and validate it against the given event."
     $secret, $nonRetriableError = Get-CurrentSecret -UnversionedSecretId $UnversionedSecretId `
         -ExpectedSecretId $VersionedSecretId `
         -ExpectedLifecycleState $expectedLifecycleState `
@@ -276,12 +304,11 @@ function Invoke-PendingSecretImport([string]$VersionedSecretId, [string]$Unversi
     }
     $secret | Add-Member -NotePropertyName "value" -NotePropertyValue $activeCredentialValue -Force
     $secret.providerConfig.activeCredentialId = $activeCredentialId
-    $updatePendingSecretRequestBody = ConvertTo-Json $secret -Depth $MAX_JSON_DEPTH -Compress
 
     # Call the update function to store the pending secret.
     Write-Host "Step 3: Update the pending secret."
     $updatedSecret, $nonRetriableError = Update-PendingSecret -UnversionedSecretId $UnversionedSecretId `
-        -UpdatePendingSecretRequestBody $updatePendingSecretRequestBody `
+        -PendingSecret $secret `
         -CallerName $callerName
     if ($nonRetriableError) {
         Write-Host $nonRetriableError
@@ -296,7 +323,7 @@ function Invoke-PendingSecretRotation([string]$VersionedSecretId, [string]$Unver
     $callerName = "Invoke-PendingSecretRotation"
 
     # Step 1: Validate the current secret state and ensure it's in the correct lifecycle state (RotationPending).
-    Write-Host "Step 1: Get the current secret for validation and the ground truth."
+    Write-Host "Step 1: Get the current secret as the source of truth, and validate it against the given event."
     $secret, $nonRetriableError = Get-CurrentSecret -UnversionedSecretId $UnversionedSecretId `
         -ExpectedSecretId $VersionedSecretId `
         -ExpectedLifecycleState $expectedLifecycleState `
@@ -321,12 +348,11 @@ function Invoke-PendingSecretRotation([string]$VersionedSecretId, [string]$Unver
 
     # Update the secret object to mark the newly regenerated inactive credential as the active credential.
     $secret.providerConfig.activeCredentialId = $inactiveCredentialId
-    $updatePendingSecretRequestBody = ConvertTo-Json $secret -Depth $MAX_JSON_DEPTH -Compress
 
     # Step 3: Update the pending secret in Azure Key Vault with the newly regenerated credential information.
     Write-Host "Step 3: Update the pending secret."
     $updatedSecret, $nonRetriableError = Update-PendingSecret -UnversionedSecretId $UnversionedSecretId `
-        -UpdatePendingSecretRequestBody $updatePendingSecretRequestBody `
+        -PendingSecret $secret `
         -CallerName $callerName
     if ($nonRetriableError) {
         Write-Host $nonRetriableError
@@ -334,27 +360,5 @@ function Invoke-PendingSecretRotation([string]$VersionedSecretId, [string]$Unver
     }
 }
 
-# Set the error action preference to "Stop" to halt script execution on errors.
-$ErrorActionPreference = "Stop"
-
-# Extract the event type and versioned secret ID for further operations.
-$EventGridEvent | ConvertTo-Json -Depth $MAX_JSON_DEPTH -Compress | Write-Host
-$eventType = $EventGridEvent.eventType
-$versionedSecretId = $EventGridEvent.data.Id
-if (-not ($versionedSecretId -match "(https://[^/]+/[^/]+/[^/]+)/[0-9a-f]{32}")) {
-    throw "The versioned secret ID '$versionedSecretId' didn't match the expected pattern."
-}
-$unversionedSecretId = $Matches[1]
-
-# Handle the EventGrid event based on its type.
-switch ($eventType) {
-    "Microsoft.KeyVault.SecretImportPending" {
-        Invoke-PendingSecretImport -VersionedSecretId $versionedSecretId -UnversionedSecretId $unversionedSecretId
-    }
-    "Microsoft.KeyVault.SecretRotationPending" {
-        Invoke-PendingSecretRotation -VersionedSecretId $versionedSecretId -UnversionedSecretId $unversionedSecretId
-    }
-    default {
-        throw "The Event Grid event '$eventType' is unsupported. Expected 'Microsoft.KeyVault.SecretImportPending' or 'Microsoft.KeyVault.SecretRotationPending'."
-    }
-}
+# Call the Main function to execute the script logic.
+Main
