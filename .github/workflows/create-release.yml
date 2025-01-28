@@ -1,0 +1,28 @@
+name: create-release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release-job:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout the code.
+      uses: actions/checkout@v4
+
+    - name: Create a zip file for each function.
+      run: |
+        $items = Get-ChildItem -Path ./Functions/
+        foreach ($item in $items) {
+          $functionName = $item.Name
+          $functionPath = $item.FullName -replace '\\','/'
+          Compress-Archive -Path "$functionPath/*" -DestinationPath "$functionName.zip" -Force
+        }
+
+    - name: Upload each zip file as release assets.
+      uses: softprops/action-gh-release@v2
+      with:
+        files: "*.zip"
