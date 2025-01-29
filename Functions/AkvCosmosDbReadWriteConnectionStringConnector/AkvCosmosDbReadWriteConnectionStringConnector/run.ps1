@@ -1,18 +1,18 @@
-<# 
-This PowerShell script is designed for Azure Functions that automatically handles the rotation and import of credentials (CosmosDb account connection strings) stored in Azure Key Vault by responding to Event Grid events. 
-It ensures that secrets are updated and synchronized with their associated CosmosDb accounts, helping automate secret management using Key Vault data plane APIs.
+<#
+This PowerShell script is designed for Azure Functions that automatically handle the rotation and import of credentials (Azure Cosmos DB read-write account connection strings) stored in Azure Key Vault (AKV) by responding to Azure Event Grid events.
+It ensures that secrets are updated and synchronized with their associated Azure Cosmos DB accounts, helping to automate secret management using AKV's data plane APIs.
 #>
 
 # Parameters for the Azure Function triggered by an Event Grid Event.
 param([object]$EventGridEvent, [object]$TriggerMetadata)
 
-# Constants
+# Constants.
 $MAX_RETRY_ATTEMPTS = 30  # Maximum number of retry attempts to poll for a secret update.
-$MAX_JSON_DEPTH = 10      # Maximum JSON depth allowed when serializing objects.
-$DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for Key Vault data plane operations.
-$AZURE_FUNCTION_NAME = "AkvCosmosDbReadWriteConnectionStringConnector" # Name of the Azure Function.
+$MAX_JSON_DEPTH = 10  # Maximum JSON depth allowed when serializing objects.
+$DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for AKV data plane operations.
+$AZURE_FUNCTION_NAME = "AkvCosmosDbReadWriteConnectionStringConnector"  # Name of the Azure Function.
 
-# Extract subscription ID, resource group name, and app name from environment variables to construct the expected function resource ID.
+# Extract subscription ID, resource group name, and app name from environment variables to construct the expected Azure Function resource ID.
 # These environment variables are set by the Azure Function App runtime.
 $EXPECTED_FUNCTION_APP_SUBSCRIPTION_ID = $env:WEBSITE_OWNER_NAME.Substring(0, 36)
 $EXPECTED_FUNCTION_APP_RG_NAME = $env:WEBSITE_RESOURCE_GROUP
@@ -21,12 +21,13 @@ $EXPECTED_FUNCTION_APP_NAME = $env:WEBSITE_SITE_NAME
 # Construct the expected Azure Function resource ID.
 $EXPECTED_FUNCTION_RESOURCE_ID = "/subscriptions/$EXPECTED_FUNCTION_APP_SUBSCRIPTION_ID/resourceGroups/$EXPECTED_FUNCTION_APP_RG_NAME/providers/Microsoft.Web/sites/$EXPECTED_FUNCTION_APP_NAME/functions/$AZURE_FUNCTION_NAME"
 
-function Main {
-    # Set the error action preference to "Stop" to halt script execution on errors.
+function Invoke-MainLogic {
+    # Set the error action preference to "Stop" to halt script execution on errors, and explicitly enable informational logs.
     $ErrorActionPreference = "Stop"
+    $InformationPreference = "Continue"
 
     # Extract the event type and versioned secret ID for further operations.
-    $EventGridEvent | ConvertTo-Json -Depth $MAX_JSON_DEPTH -Compress | Write-Host
+    $EventGridEvent | ConvertTo-Json -Depth $MAX_JSON_DEPTH -Compress | Write-Information
     $eventType = $EventGridEvent.eventType
     $versionedSecretId = $EventGridEvent.data.Id
     if (-not ($versionedSecretId -match "(https://[^/]+/[^/]+/[^/]+)/[0-9a-f]{32}")) {
@@ -34,7 +35,7 @@ function Main {
     }
     $unversionedSecretId = $Matches[1]
 
-    # Handle the EventGrid event based on its type.
+    # Handle the Event Grid event based on its type.
     switch ($eventType) {
         "Microsoft.KeyVault.SecretImportPending" {
             Invoke-PendingSecretImport -VersionedSecretId $versionedSecretId -UnversionedSecretId $unversionedSecretId
@@ -48,8 +49,8 @@ function Main {
     }
 }
 
-# Function to get the inactive credential ID based on the currently active credential (either 'PrimaryMasterKey' or 'SecondaryMasterKey').
-# Azure CosmosDb Account has two read-write keys - PrimaryMasterKey and SecondaryMasterKey, and this function switches between them.
+# Function to get the inactive credential ID based on what AKV considers to be the currently active one.
+# Azure Cosmos DB accounts support two read-write access keys, and this function switches between them (either 'PrimaryMasterKey' or 'SecondaryMasterKey').
 function Get-InactiveCredentialId([string]$ActiveCredentialId) {
     $inactiveCredentialId = switch ($ActiveCredentialId) {
         "PrimaryMasterKey" { "SecondaryMasterKey" }
@@ -59,8 +60,19 @@ function Get-InactiveCredentialId([string]$ActiveCredentialId) {
     return $inactiveCredentialId
 }
 
-# Function to get the key kind(primary or secondary) based on the passed credential (either 'PrimaryMasterKey' or 'SecondaryMasterKey').
-# Azure CosmosDb Account has two kinds of read-write keys - primary and secondary, and this function maps keys to the key kind required for key re-generation.
+# Function to get the key kind used for retrieval based on the given credential ID.
+# This function maps key names to key kinds, as required for retrieval by Azure Cosmos DB.
+function Get-KeyKindForRetrieval([string]$CredentialId) {
+    $keyKind = switch ($CredentialId) {
+        "PrimaryMasterKey" { "Primary SQL Connection String" }
+        "SecondaryMasterKey" { "Secondary SQL Connection String" }
+        default { throw "The credential ID '$CredentialId' didn't match the expected pattern. Expected 'PrimaryMasterKey' or 'SecondaryMasterKey'." }
+    }
+    return $keyKind
+}
+
+# Function to get the key kind used for regeneration based on the given credential ID.
+# This function maps key names to key kinds, as required for regeneration by Azure Cosmos DB.
 function Get-KeyKindForRegeneration([string]$CredentialId) {
     $keyKind = switch ($CredentialId) {
         "PrimaryMasterKey" { "primary" }
@@ -70,42 +82,41 @@ function Get-KeyKindForRegeneration([string]$CredentialId) {
     return $keyKind
 }
 
-# Function to get the value of the active credential (CosmosDb account connection string) via active key retrieval from Azure.
-# It checks for valid inputs and retrieves the specified key from the CosmosDb account and then forms the corresponding connection string
+# Function to retrieve the value of the active credential (read-write account connection string) from the secret provider (Azure Cosmos DB).
+# This function validates the input and retrieves the specified read-write connection string from the Azure Cosmos DB account.
 function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddress) {
-    # Validate if the active credential ID is provided.
+    # Ensure that the active credential ID is provided.
     if (-not ($ActiveCredentialId)) {
         return @($null, "The active credential ID is missing.")
     }
-    # Ensure the credential ID matches the expected pattern ('PrimaryMasterKey' or 'SecondaryMasterKey').
+    # Ensure that the credential ID matches the expected pattern ('PrimaryMasterKey' or 'SecondaryMasterKey').
     if ($ActiveCredentialId -notin @("PrimaryMasterKey", "SecondaryMasterKey")) {
         return @($null, "The active credential ID '$ActiveCredentialId' didn't match the expected pattern. Expected 'PrimaryMasterKey' or 'SecondaryMasterKey'.")
     }
-    # Validate if the provider address (resource ID of the CosmosDb account) is provided.
+    # Ensure that the provider address (resource ID of the Azure Cosmos DB account) is provided.
     if (-not ($ProviderAddress)) {
         return @($null, "The provider address is missing.")
     }
-    # Ensure the provider address matches the expected Azure CosmosDb Account resource format.
+    # Ensure that the provider address (resource ID of the Azure Cosmos DB account) matches the expected secret provider format.
     if (-not ($ProviderAddress -match "/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft.DocumentDB/databaseAccounts/([^/]+)")) {
         return @($null, "The provider address '$ProviderAddress' didn't match the expected pattern.")
     }
 
-    # Extract details from the provider address (subscription ID, resource group, CosmosDb account name).
+    # Extract details from the provider address (subscription ID, resource group name, account name).
     $subscriptionId = $Matches[1]
     $resourceGroupName = $Matches[2]
-    $CosmosDbAccountName = $Matches[3]
+    $accountName = $Matches[3]
 
-    # Select the subscription to operate on
-    $null = Select-AzSubscription -SubscriptionId $subscriptionId
+    # Select the subscription to operate on.
+    $null = Set-AzContext -SubscriptionId $subscriptionId
 
-    # Retrieve the specified CosmosDb account key from the CosmosDb account and create connection string (credential) .
+    # Retrieve the specified credential (read-write account connection string) from the secret provider (Azure Cosmos DB).
     try {
-         # Retrieve the specified Cosmos DB account key
-        $accountKey = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -Type "Keys").$ActiveCredentialId
-        
-        $credentialValue = "AccountEndpoint=https://$cosmosDbAccountName.documents.azure.com:443/;AccountKey=$accountKey;"
+        $keyKindForRetrieval = Get-KeyKindForRetrieval -CredentialId $ActiveCredentialId
+        $credentialValue = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $accountName -Type "ConnectionStrings").$keyKindForRetrieval
         return @($credentialValue, $null)
-    } catch [Microsoft.Rest.Azure.CloudException] {
+    }
+    catch [Microsoft.Rest.Azure.CloudException] {
         # Handle any exceptions by logging detailed information and re-throwing the exception.
         $httpStatusCode = $_.Exception.Response.StatusCode
         $httpStatusCodeDescription = "$([int]$httpStatusCode) ($httpStatusCode)"
@@ -113,16 +124,16 @@ function Get-CredentialValue([string]$ActiveCredentialId, [string]$ProviderAddre
         $requestId = $_.Exception.RequestId
         $errorCode = $_.Exception.Body.Code
         $errorMessage = $_.Exception.Body.Message
-        Write-Host "  httpStatusCode: '$httpStatusCodeDescription'"
-        Write-Host "  requestUri: '$requestUri'"
-        Write-Host "  x-ms-request-id: '$requestId'"
-        Write-Host "  errorCode: '$errorCode'"
-        Write-Host "  errorMessage: '$errorMessage'"
+        Write-Information "  httpStatusCode: '$httpStatusCodeDescription'"
+        Write-Information "  requestUri: '$requestUri'"
+        Write-Information "  x-ms-request-id: '$requestId'"
+        Write-Information "  errorCode: '$errorCode'"
+        Write-Information "  errorMessage: '$errorMessage'"
         throw "Encountered unexpected exception during Get-CredentialValue. Throwing."
     }
 }
 
-# Function to regenerate a CosmosDb account connection string (credential).
+# Function to regenerate a credential (read-write account connection string) via the secret provider (Azure Cosmos DB).
 # This function generates a new inactive credential, which can later be made active.
 function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$ProviderAddress) {
     if (-not ($ProviderAddress)) {
@@ -133,35 +144,35 @@ function Invoke-CredentialRegeneration([string]$InactiveCredentialId, [string]$P
     }
     $subscriptionId = $Matches[1]
     $resourceGroupName = $Matches[2]
-    $CosmosDbAccountName = $Matches[3]
+    $accountName = $Matches[3]
 
-    $null = Select-AzSubscription -SubscriptionId $subscriptionId
+    $null = Set-AzContext -SubscriptionId $subscriptionId
 
-    # Attempt to regenerate the inactive credential (CosmosDb account connection string) and return it.
+    # Attempt to regenerate the inactive credential (Azure Cosmos DB read-write account connection string) and return it.
     try {
-        # Regenerate the inactive key
-        # Regenerate the inactive key
-        $keyKindToRegerenerate = Get-KeyKindForRegeneration -CredentialId $InactiveCredentialId
-        $accountKey = New-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $cosmosDbAccountName -KeyKind $keyKindToRegerenerate
-        $credentialValue = "AccountEndpoint=https://$cosmosDbAccountName.documents.azure.com:443/;AccountKey=$accountKey;"
-        return @($credentialValue, $null)        
-    } catch [Microsoft.Rest.Azure.CloudException] {
+        $keyKindForRegeneration = Get-KeyKindForRegeneration -CredentialId $InactiveCredentialId
+        $keyKindForRetrieval = Get-KeyKindForRetrieval -CredentialId $InactiveCredentialId
+        $null = New-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $accountName -KeyKind $keyKindForRegeneration
+        $credentialValue = (Get-AzCosmosDBAccountKey -ResourceGroupName $resourceGroupName -Name $accountName -Type "ConnectionStrings").$keyKindForRetrieval
+        return @($credentialValue, $null)
+    }
+    catch [Microsoft.Rest.Azure.CloudException] {
         $httpStatusCode = $_.Exception.Response.StatusCode
         $httpStatusCodeDescription = "$([int]$httpStatusCode) ($httpStatusCode)"
         $requestUri = $_.Exception.Request.RequestUri
         $requestId = $_.Exception.RequestId
         $errorCode = $_.Exception.Body.Code
         $errorMessage = $_.Exception.Body.Message
-        Write-Host "  httpStatusCode: '$httpStatusCodeDescription'"
-        Write-Host "  requestUri: '$requestUri'"
-        Write-Host "  x-ms-request-id: '$requestId'"
-        Write-Host "  errorCode: '$errorCode'"
-        Write-Host "  errorMessage: '$errorMessage'"
+        Write-Information "  httpStatusCode: '$httpStatusCodeDescription'"
+        Write-Information "  requestUri: '$requestUri'"
+        Write-Information "  x-ms-request-id: '$requestId'"
+        Write-Information "  errorCode: '$errorCode'"
+        Write-Information "  errorMessage: '$errorMessage'"
         throw "Encountered unexpected exception during Invoke-CredentialRegeneration. Throwing."
     }
 }
 
-# Function to get the current secret from Azure Key Vault for validation purposes.
+# Function to get the current secret from AKV for validation purposes.
 # This function ensures that the secret is in the expected state before proceeding with further actions.
 function Get-CurrentSecret(
     [string]$UnversionedSecretId,
@@ -173,22 +184,22 @@ function Get-CurrentSecret(
     $actualLifecycleState = $null
     $actualFunctionResourceId = $null
 
-    # Get the auth token for authenticating requests to Key Vault.
+    # Get the access token for authenticating requests to AKV.
     $token = (Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString).Token
 
-    # In rare cases, this handler might receive the published event before AKV has finished committing to CosmosDb.
+    # In rare cases, this handler might receive the published event before AKV has finished committing to its own internal storage.
     # To mitigate this, poll the current secret for up to 30s until its current lifecycle state matches that of the published event.
     foreach ($i in 1..$MAX_RETRY_ATTEMPTS) {
         $clientRequestId = [Guid]::NewGuid().ToString()
-        Write-Host "  Attempt #$i with x-ms-client-request-id: '$clientRequestId'"
+        Write-Information "  Attempt #$i with x-ms-client-request-id: '$clientRequestId'"
 
-         # Define HTTP headers for the request.
+        # Define HTTP headers for the request.
         $headers = @{
             "User-Agent"             = "$AZURE_FUNCTION_NAME/1.0 ($CallerName; Step 1; Attempt $i)"
             "x-ms-client-request-id" = $clientRequestId
         }
 
-        # Perform a GET request to fetch the current secret from Key Vault.
+        # Perform a GET request to fetch the current secret from AKV.
         $response = Invoke-WebRequest -Uri "${UnversionedSecretId}?api-version=$DATA_PLANE_API_VERSION" `
             -Method "GET" `
             -Authentication OAuth `
@@ -200,7 +211,7 @@ function Get-CurrentSecret(
         $actualLifecycleState = $secret.attributes.lifecycleState
         $actualFunctionResourceId = $secret.providerConfig.functionResourceId
 
-        # Check if the actual lifecycle state matches the expected state, stop polling if so.
+        # Stop polling if the actual state matches the expected state.
         if (
             ($actualSecretId -eq $ExpectedSecretId) -and
             ($actualLifecycleState -eq $ExpectedLifecycleState) -and
@@ -211,7 +222,7 @@ function Get-CurrentSecret(
         Start-Sleep -Seconds 1
     }
 
-    # Check if the secret did not reach the expected state after retries, return an error message.
+    # Return an error message if the secret's actual state did not reach the expected state after polling.
     if (-not ($actualSecretId -eq $ExpectedSecretId)) {
         return @($null, "The secret '$actualSecretId' did not transition to '$ExpectedSecretId' after approximately $MAX_RETRY_ATTEMPTS seconds. Exiting.")
     }
@@ -222,29 +233,29 @@ function Get-CurrentSecret(
         return @($null, "Expected function resource ID to be '$EXPECTED_FUNCTION_RESOURCE_ID', but found '$actualFunctionResourceId'. Exiting.")
     }
 
-    # Output detailed secret properties for logging purposes.
+    # Log part of the secret's metadata for telemetry purposes.
     $lifecycleDescription = $secret.attributes.lifecycleDescription
     $validityPeriod = $secret.rotationPolicy.validityPeriod
     $activeCredentialId = $secret.providerConfig.activeCredentialId
     $providerAddress = $secret.providerConfig.providerAddress
     $functionResourceId = $secret.providerConfig.functionResourceId
-    Write-Host "  lifecycleDescription: '$lifecycleDescription'"
-    Write-Host "  validityPeriod: '$validityPeriod'"
-    Write-Host "  activeCredentialId: '$activeCredentialId'"
-    Write-Host "  providerAddress: '$providerAddress'"
-    Write-Host "  functionResourceId: '$functionResourceId'"
+    Write-Information "  lifecycleDescription: '$lifecycleDescription'"
+    Write-Information "  validityPeriod: '$validityPeriod'"
+    Write-Information "  activeCredentialId: '$activeCredentialId'"
+    Write-Information "  providerAddress: '$providerAddress'"
+    Write-Information "  functionResourceId: '$functionResourceId'"
 
     return @($secret, $null)
 }
 
-# Function to update a secret in Azure Key Vault with the 'Pending' lifecycle state.
-# It updates the secret's attributes based on the provided request body.
+# Function to update a secret in AKV whose lifecycle state is currently either 'ImportPending' or 'RotationPending'.
+# This function updates the secret's attributes based on the provided request body.
 function Update-PendingSecret(
     [string]$UnversionedSecretId,
-    [string]$PendingSecret,
+    [object]$PendingSecret,
     [string]$CallerName) {
     $clientRequestId = [Guid]::NewGuid().ToString()
-    Write-Host "  x-ms-client-request-id: '$clientRequestId'"
+    Write-Information "  x-ms-client-request-id: '$clientRequestId'"
     $token = (Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString).Token
     $headers = @{
         "User-Agent"             = "$AZURE_FUNCTION_NAME/1.0 ($CallerName; Step 3)"
@@ -252,7 +263,7 @@ function Update-PendingSecret(
     }
     $updatePendingSecretRequestBody = ConvertTo-Json $PendingSecret -Depth $MAX_JSON_DEPTH -Compress
 
-    # Perform an HTTP PUT request to update the secret's state via UpdatePendingSecret API.
+    # Perform an HTTP PUT request to update the pending secret via the UpdatePendingSecret API.
     try {
         $response = Invoke-WebRequest -Uri "${UnversionedSecretId}/pending?api-version=$DATA_PLANE_API_VERSION" `
             -Method "PUT" `
@@ -265,11 +276,12 @@ function Update-PendingSecret(
         $lifecycleState = $updatedSecret.attributes.lifecycleState
         $lifecycleDescription = $updatedSecret.attributes.lifecycleDescription
         $activeCredentialId = $updatedSecret.providerConfig.activeCredentialId
-        Write-Host "  lifecycleState: '$lifecycleState'"
-        Write-Host "  lifecycleDescription: '$lifecycleDescription'"
-        Write-Host "  activeCredentialId: '$activeCredentialId'"
+        Write-Information "  lifecycleState: '$lifecycleState'"
+        Write-Information "  lifecycleDescription: '$lifecycleDescription'"
+        Write-Information "  activeCredentialId: '$activeCredentialId'"
         return @($updatedSecret, $null)
-    } catch {
+    }
+    catch {
         $httpStatusCode = $_.Exception.Response.StatusCode
         $httpStatusCodeDescription = "$([int]$httpStatusCode) ($httpStatusCode)"
         $errorBody = $_.ErrorDetails.Message | ConvertFrom-Json
@@ -277,11 +289,11 @@ function Update-PendingSecret(
         $requestId = $_.Exception.Response.Headers.GetValues("x-ms-request-id") -join ","
         $errorCode = $errorBody.error.code
         $errorMessage = $errorBody.error.message
-        Write-Host "  httpStatusCode: '$httpStatusCodeDescription'"
-        Write-Host "  requestUri: '$requestUri'"
-        Write-Host "  x-ms-request-id: '$requestId'"
-        Write-Host "  errorCode: '$errorCode'"
-        Write-Host "  errorMessage: '$errorMessage'"
+        Write-Information "  httpStatusCode: '$httpStatusCodeDescription'"
+        Write-Information "  requestUri: '$requestUri'"
+        Write-Information "  x-ms-request-id: '$requestId'"
+        Write-Information "  errorCode: '$errorCode'"
+        Write-Information "  errorMessage: '$errorMessage'"
 
         # If the error is in the 400 range, classify it as non-retriable and return.
         if (($httpStatusCode -ge 400) -and ($httpStatusCode -lt 500)) {
@@ -293,72 +305,73 @@ function Update-PendingSecret(
     }
 }
 
-# Function to handle the pending import of a secret.
-# Validates the current secret state, fetches its credentials, and updates it with imported data.
+# Function to handle the import of a pending secret.
+# This function retrieves the active credential and updates the pending secret with this imported data.
 function Invoke-PendingSecretImport([string]$VersionedSecretId, [string]$UnversionedSecretId) {
     $expectedLifecycleState = "ImportPending"
     $callerName = "Invoke-PendingSecretImport"
 
-    Write-Host "Step 1: Get the current secret as the source of truth, and validate it against the given event."
+    # Step 1: Validate the current secret state and ensure that it's in the correct lifecycle state (ImportPending).
+    Write-Information "Step 1: Get the current secret as the source of truth, and validate it against the given event."
     $secret, $nonRetriableError = Get-CurrentSecret -UnversionedSecretId $UnversionedSecretId `
         -ExpectedSecretId $VersionedSecretId `
         -ExpectedLifecycleState $expectedLifecycleState `
         -CallerName $callerName
     if ($nonRetriableError) {
-        Write-Host $nonRetriableError
+        Write-Information $nonRetriableError
         return
     }
 
-    # Import the secret from the provider and prepare the new secret in-memory for update.
-    Write-Host "Step 2: Import the secret from the provider and prepare the new secret in-memory."
+    # Step 2: Import the secret from the provider and prepare the new secret in-memory for update.
+    Write-Information "Step 2: Import the secret from the provider and prepare the new secret in-memory."
     $activeCredentialId = $secret.providerConfig.activeCredentialId
     $providerAddress = $secret.providerConfig.providerAddress
     $activeCredentialValue, $nonRetriableError = Get-CredentialValue -ActiveCredentialId $activeCredentialId `
         -ProviderAddress $providerAddress
     if ($nonRetriableError) {
-        Write-Host $nonRetriableError
+        Write-Information $nonRetriableError
         return
     }
     $secret | Add-Member -NotePropertyName "value" -NotePropertyValue $activeCredentialValue -Force
     $secret.providerConfig.activeCredentialId = $activeCredentialId
 
-    # Call the update function to store the pending secret.
-    Write-Host "Step 3: Update the pending secret."
+    # Step 3: Update the pending secret in AKV with the retrieved credential.
+    Write-Information "Step 3: Update the pending secret."
     $updatedSecret, $nonRetriableError = Update-PendingSecret -UnversionedSecretId $UnversionedSecretId `
         -PendingSecret $secret `
         -CallerName $callerName
     if ($nonRetriableError) {
-        Write-Host $nonRetriableError
+        Write-Information $nonRetriableError
         return
     }
 }
 
-# Function to handle pending secret rotation in Azure Key Vault.
-# This function rotates the secret by regenerating an inactive credential and updating the secret's lifecycle state.
+# Function to handle the rotation of a pending secret.
+# This function regenerates the inactive credential and saves it to AKV, promoting it to be the new active credential.
 function Invoke-PendingSecretRotation([string]$VersionedSecretId, [string]$UnversionedSecretId) {
     $expectedLifecycleState = "RotationPending"
     $callerName = "Invoke-PendingSecretRotation"
 
-    # Step 1: Validate the current secret state and ensure it's in the correct lifecycle state (RotationPending).
-    Write-Host "Step 1: Get the current secret as the source of truth, and validate it against the given event."
+    # Step 1: Validate the current secret state and ensure that it's in the correct lifecycle state (RotationPending).
+    Write-Information "Step 1: Get the current secret as the source of truth, and validate it against the given event."
     $secret, $nonRetriableError = Get-CurrentSecret -UnversionedSecretId $UnversionedSecretId `
         -ExpectedSecretId $VersionedSecretId `
         -ExpectedLifecycleState $expectedLifecycleState `
         -CallerName $callerName
     if ($nonRetriableError) {
-        Write-Host $nonRetriableError
+        Write-Information $nonRetriableError
         return
     }
 
     # Step 2: Regenerate the inactive credential for the secret.
-    Write-Host "Step 2: Regenerate the inactive credential via the provider and prepare the new secret in-memory."
+    Write-Information "Step 2: Regenerate the inactive credential via the provider and prepare the new secret in-memory."
     $activeCredentialId = $secret.providerConfig.activeCredentialId
     $providerAddress = $secret.providerConfig.providerAddress
     $inactiveCredentialId = Get-InactiveCredentialId -ActiveCredentialId $activeCredentialId
     $inactiveCredentialValue, $nonRetriableError = Invoke-CredentialRegeneration -InactiveCredentialId $inactiveCredentialId `
         -ProviderAddress $providerAddress
     if ($nonRetriableError) {
-        Write-Host $nonRetriableError
+        Write-Information $nonRetriableError
         return
     }
     $secret | Add-Member -NotePropertyName "value" -NotePropertyValue $inactiveCredentialValue -Force
@@ -366,16 +379,16 @@ function Invoke-PendingSecretRotation([string]$VersionedSecretId, [string]$Unver
     # Update the secret object to mark the newly regenerated inactive credential as the active credential.
     $secret.providerConfig.activeCredentialId = $inactiveCredentialId
 
-    # Step 3: Update the pending secret in Azure Key Vault with the newly regenerated credential information.
-    Write-Host "Step 3: Update the pending secret."
+    # Step 3: Update the pending secret in AKV with the newly regenerated credential information.
+    Write-Information "Step 3: Update the pending secret."
     $updatedSecret, $nonRetriableError = Update-PendingSecret -UnversionedSecretId $UnversionedSecretId `
         -PendingSecret $secret `
         -CallerName $callerName
     if ($nonRetriableError) {
-        Write-Host $nonRetriableError
+        Write-Information $nonRetriableError
         return
     }
 }
 
-# Call the Main function to execute the script logic.
-Main
+# Call the main function for executing this script's logic.
+Invoke-MainLogic
