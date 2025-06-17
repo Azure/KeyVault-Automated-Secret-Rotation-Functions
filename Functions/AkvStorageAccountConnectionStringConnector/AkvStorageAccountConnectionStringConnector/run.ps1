@@ -11,6 +11,10 @@ $MAX_RETRY_ATTEMPTS = 30  # Maximum number of retry attempts to poll for a secre
 $MAX_JSON_DEPTH = 10  # Maximum JSON depth allowed when serializing objects.
 $DATA_PLANE_API_VERSION = "7.6-preview.1"  # The API version for AKV data plane operations.
 $AZURE_FUNCTION_NAME = "AkvStorageAccountConnectionStringConnector"  # Name of the Azure Function.
+$MODULE_NAMES = @(
+    "Az.Accounts"
+    "Az.Storage"
+)
 
 # Extract subscription ID, resource group name, and app name from environment variables to construct the expected Azure Function resource ID.
 # These environment variables are set by the Azure Function App runtime.
@@ -25,6 +29,12 @@ function Invoke-MainLogic {
     # Set the error action preference to "Stop" to halt script execution on errors, and explicitly enable informational logs.
     $ErrorActionPreference = "Stop"
     $InformationPreference = "Continue"
+
+    # Log the module versions used by this script.
+    foreach ($moduleName in $MODULE_NAMES) {
+        $moduleVersion = (Get-Module -Name $moduleName -ListAvailable | Select-Object -First 1).Version
+        Write-Information "$moduleName Version: '$moduleVersion'"
+    }
 
     # Extract the event type and versioned secret ID for further operations.
     $EventGridEvent | ConvertTo-Json -Depth $MAX_JSON_DEPTH -Compress | Write-Information

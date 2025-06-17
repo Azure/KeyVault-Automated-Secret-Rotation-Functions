@@ -2,6 +2,6 @@
 # See https://aka.ms/functionsmanageddependency for additional information.
 #
 @{
-    'Az.Accounts' = '4.*'
+    'Az.Accounts' = '5.*'
     'Az.CosmosDB' = '1.*'
 }
